@@ -8,124 +8,104 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
+#include <algorithm>
+inline constexpr size_t maxMsg = 32 << 20;  // likely larger than the kernel buffer
 
-void msg(const std::string &msg) { std::cerr << msg << "\n"; }
+void msg(const std::string_view msg) { std::cerr << msg << "\n"; }
 
-void die(const std::string &msg) {
+void die(const std::string_view msg) {
   int err = errno;
   std::cerr << err << " " << msg << "\n";
   abort();
 }
 
-int32_t readFull(const int fileDescriptor, std::string &buffer,
-                 size_t numOfBytes, const size_t startingOffset = 0) {
+int32_t readFull(const int fileDescriptor, uint8_t* buffer, size_t len){
 
-  size_t offset{startingOffset};
+  while(len > 0){
+    ssize_t returnVal = read(fileDescriptor,buffer,len);
+    if(returnVal <= 0) return -1; // error or unexpected EOF
 
-  while (numOfBytes) {
-    ssize_t returnVal =
-        read(fileDescriptor, buffer.data() + offset, numOfBytes);
-    if (returnVal == 0)
-      return 0; // "EOF";
-    else if (returnVal == -1) {
-      if (errno == EINTR)
-        continue; // try again
-      else
-        return -1; // error;
-    }
-
-    auto rvSize = static_cast<size_t>(returnVal);
-    assert(rvSize <= numOfBytes);
-
-    numOfBytes -= rvSize;
-    offset += rvSize;
+    assert(static_cast<size_t>(returnVal) <= len);
+    
+    len -= static_cast<size_t>(returnVal);
+    buffer += returnVal;
   }
 
   return 0;
 }
 
-int32_t writeAll(const int fileDescriptor, std::string_view buffer,
-                 size_t numOfBytes) {
+int32_t writeAll(const int fileDescriptor, const uint8_t* buffer, size_t len){
 
-  size_t offset{};
-
-  while (numOfBytes > 0) {
-    ssize_t returnVal =
-        write(fileDescriptor, buffer.data() + offset, numOfBytes);
+  while (len > 0) {
+    ssize_t returnVal = write(fileDescriptor, buffer, len);
     if (returnVal <= 0)
-      return -1; // error
+      return -1; // error or unexpected EOF
 
-    auto rvSize = static_cast<size_t>(returnVal);
-    assert(rvSize <= numOfBytes);
+    assert(static_cast<size_t>(returnVal) <= len);
 
-    numOfBytes -= rvSize;
-    offset += rvSize;
+    len -= static_cast<size_t>(returnVal);
+    buffer += returnVal;
   }
 
   return 0;
 }
 
-int32_t query(const int fileDescriptor, std::string_view text) {
+// append to the back
+void appendBuffer(std::vector<uint8_t> &buffer,const uint8_t* data,const size_t len){
+  buffer.insert(buffer.end(),data,data+len);
+}
 
-  constexpr size_t maxMsg{4096};
-  uint32_t len = static_cast<uint32_t>(text.length());
-  if (len > maxMsg)
-    return -1;
+// the `query` function was simply splited into `send_req` and `read_res`.
+int32_t sendRequest(const int fileDescriptor, const uint8_t* text,const size_t len){
 
-  // send request
+  if(len > maxMsg) return -1;
 
-  std::string wBuffer(4 + maxMsg, '\0');
-  std::memcpy(wBuffer.data(), &len, 4);
-  std::memcpy(wBuffer.data() + 4, text.data(), len);
+  uint32_t len32{static_cast<uint32_t>(len)};
+  std::vector<uint8_t> wBuffer{};
 
-  if (int32_t err = writeAll(fileDescriptor, wBuffer, 4 + len))
-    return err;
+  appendBuffer(wBuffer, reinterpret_cast<const uint8_t *>(&len32), 4);
+  appendBuffer(wBuffer,text,len);
+
+  return writeAll(fileDescriptor, wBuffer.data(), wBuffer.size());
+}
+
+int32_t readResult(const int fileDescriptor){
 
   // 4 bytes header
-  std::string rBuffer(4 + maxMsg, '\0');
+  std::vector<uint8_t> rBuffer(4);
+  
   errno = 0;
+  
+  int32_t err = readFull(fileDescriptor, &rBuffer[0],4);
+  if(err){
+    if(errno == 0) msg("EOF");
+    else msg("read() error");
 
-  int32_t err = readFull(fileDescriptor, rBuffer, 4);
-  if (err) {
-    msg(errno == 0 ? "EOF" : "read() error");
     return err;
   }
 
-  std::memcpy(&len, rBuffer.data(), 4);
-  if (len > maxMsg) {
+  uint32_t len{};
+  std::memcpy(&len,rBuffer.data(),4); //assume little endian
+  if(len > maxMsg){
     msg("too long");
     return -1;
   }
 
   // reply body
-  err = readFull(fileDescriptor, rBuffer, len, 4);
-  if (err == -1) {
+  rBuffer.resize(4+len);
+  err = readFull(fileDescriptor, &rBuffer[4], len);
+  if(err){
     msg("read() error");
     return err;
   }
 
-  std::string_view printView{rBuffer.data() + 4, len};
-  std::cout << "server says: " << printView << "\n";
-
+  // do something
+  std::string_view printView{reinterpret_cast<const char *>(&rBuffer[4]),
+                             std::min(len, 100u)};
+  std::cout << "len: " << len << " data: " << printView << '\n';
   return 0;
 }
-
-/** Client setup
-
-* * The client creates its own socket and calls connect() to 127.0.0.1:1234. The
-* * kernel performs the TCP handshake with the server's kernel. Neither program
-* * writes code for that part.
-
-* * On the server, accept() now returns a new socket for this one client.
-
-* * The client write()s "hello". The bytes travel through the kernel to the
-* * server's socket.
-
-* * The server read()s them, prints "client says: hello", and write()s "world"
-* * back.
-
-* * The client read()s "world", prints it, and closes its socket.
-*/
 
 int main() {
 
@@ -144,9 +124,26 @@ int main() {
   if (returnVal)
     die("connect()");
 
-  int32_t err = query(fileDescriptor, "hello1");
-  err = query(fileDescriptor, "hello2");
-  
+  // multiple pipelined requests
+  std::vector<std::string> queryList =
+      {
+          "hello1", "hello2", "hello3",
+          // a large message requires multiple event loop iterations
+          std::string(maxMsg, 'z'),
+          "hello5",
+      };
+
+  for(const auto& query : queryList){
+    int32_t err = sendRequest(fileDescriptor, reinterpret_cast<const uint8_t *>(query.data()), query.size());
+    if(err) close(fileDescriptor);
+  }
+
+  for(size_t i = 0; i<queryList.size(); ++i){
+    int32_t err = readResult(fileDescriptor);
+    if(err) close(fileDescriptor);
+  }
+
   close(fileDescriptor);
+
   return 0;
 }

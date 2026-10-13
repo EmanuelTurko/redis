@@ -1,4 +1,5 @@
 
+#include "protocol.h"
 #include <cassert>
 #include <cerrno>
 #include <cstring>
@@ -9,105 +10,211 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
-#include <algorithm>
-inline constexpr size_t maxMsg = 32 << 20;  // likely larger than the kernel buffer
 
-void msg(const std::string_view msg) { std::cerr << msg << "\n"; }
+auto readFull(const int fileDescriptor, std::string &buffer, size_t len,
+              const size_t startingOffset = 0) -> int32_t {
 
-void die(const std::string_view msg) {
-  int err = errno;
-  std::cerr << err << " " << msg << "\n";
-  abort();
-}
-
-int32_t readFull(const int fileDescriptor, uint8_t* buffer, size_t len){
-
-  while(len > 0){
-    ssize_t returnVal = read(fileDescriptor,buffer,len);
-    if(returnVal <= 0) return -1; // error or unexpected EOF
-
-    assert(static_cast<size_t>(returnVal) <= len);
-    
-    len -= static_cast<size_t>(returnVal);
-    buffer += returnVal;
-  }
-
-  return 0;
-}
-
-int32_t writeAll(const int fileDescriptor, const uint8_t* buffer, size_t len){
-
+  size_t offset{startingOffset};
   while (len > 0) {
-    ssize_t returnVal = write(fileDescriptor, buffer, len);
+    ssize_t returnVal = read(fileDescriptor, buffer.data() + offset, len);
     if (returnVal <= 0)
       return -1; // error or unexpected EOF
 
-    assert(static_cast<size_t>(returnVal) <= len);
+    size_t bytesRead = static_cast<size_t>(returnVal);
+    assert(bytesRead <= len);
 
-    len -= static_cast<size_t>(returnVal);
-    buffer += returnVal;
+    len -= bytesRead;
+    offset += bytesRead;
   }
 
   return 0;
 }
+auto writeAll(const int fileDescriptor, std::string_view buffer,
+              size_t len) -> int32_t {
 
-// append to the back
-void appendBuffer(std::vector<uint8_t> &buffer,const uint8_t* data,const size_t len){
-  buffer.insert(buffer.end(),data,data+len);
+  while (len > 0) {
+    ssize_t returnVal = write(fileDescriptor, buffer.data(), len);
+    if (returnVal <= 0)
+      return -1; // error or unexpected EOF
+
+    const size_t bytesWritten = static_cast<size_t>(returnVal);
+    assert(bytesWritten <= len);
+
+    len -= bytesWritten;
+    buffer.remove_prefix(bytesWritten);
+  }
+
+  return 0;
 }
-
 // the `query` function was simply splited into `send_req` and `read_res`.
-int32_t sendRequest(const int fileDescriptor, const uint8_t* text,const size_t len){
+auto sendRequest(const int fileDescriptor,
+                 const std::vector<std::string> &cmd) -> int32_t {
 
-  if(len > maxMsg) return -1;
+  uint32_t len{4};
+  for (const std::string &s : cmd)
+    len += 4 + s.size();
+  if (len > maxMsg)
+    return -1;
 
-  uint32_t len32{static_cast<uint32_t>(len)};
-  std::vector<uint8_t> wBuffer{};
+  std::string wBuffer(4 + maxMsg, '\0');
+  std::memcpy(&wBuffer[0], &len, 4);
 
-  appendBuffer(wBuffer, reinterpret_cast<const uint8_t *>(&len32), 4);
-  appendBuffer(wBuffer,text,len);
+  uint32_t cmdSize = cmd.size();
+  std::memcpy(&wBuffer[4], &cmdSize, 4);
 
-  return writeAll(fileDescriptor, wBuffer.data(), wBuffer.size());
+  size_t current{8};
+
+  for (const std::string &s : cmd) {
+    uint32_t argLen = static_cast<uint32_t>(s.size());
+    std::memcpy(&wBuffer[current], &argLen, 4);
+    std::memcpy(&wBuffer[current + 4], s.data(), s.size());
+    current += 4 + s.size();
+  }
+
+  return writeAll(fileDescriptor, wBuffer, 4 + len);
 }
+auto printResponse(const uint8_t *data, size_t size) -> int32_t {
 
-int32_t readResult(const int fileDescriptor){
+  if (size < 1) {
+    msg("bad response");
+    return -1;
+  }
+
+  switch (data[0]) {
+  case static_cast<int>(Tag::Nil):
+    std::cout << "(nil)\n";
+    return 1;
+  case static_cast<int>(Tag::Error):
+    if (size < 1 + 8) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      int32_t code{};
+      uint32_t len{};
+
+      std::memcpy(&code, &data[1], 4);
+      std::memcpy(&len, &data[1 + 4], 4);
+
+      if (size < 1 + 8 + len) {
+        msg("bad response");
+        return -1;
+      }
+
+      std::string_view printView{reinterpret_cast<const char *>(&data[1 + 8]),
+                                 len};
+      std::cout << "(error) " << code << " " << printView << "\n";
+      return 1 + 8 + len;
+    }
+  case static_cast<int>(Tag::String):
+    if (size < 1 + 4) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      uint32_t len{};
+      std::memcpy(&len, &data[1], 4);
+      if (size < 1 + 4 + len) {
+        msg("bad response");
+        return -1;
+      }
+
+      std::string_view printView{reinterpret_cast<const char *>(&data[1 + 4]),
+                                 len};
+      std::cout << "(string) " << " " << printView << "\n";
+      return 1 + 4 + len;
+    }
+  case static_cast<int>(Tag::Int64):
+    if (size < 1 + 8) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      int64_t val{};
+      std::memcpy(&val, &data[1], 8);
+
+      std::cout << "(int) " << val << "\n";
+      return 1 + 8;
+    }
+  case static_cast<int>(Tag::Double):
+    if (size < 1 + 8) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      double val{};
+      std::memcpy(&val, &data[1], 8);
+      std::cout << "(double) " << val << "\n";
+      return 1 + 8;
+    }
+  case static_cast<int>(Tag::Array):
+    if (size < 1 + 4) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      uint32_t len{};
+      std::memcpy(&len, &data[1], 4);
+      std::cout << "(array) len=" << len << "\n";
+
+      size_t arrayBytes{1 + 4};
+      for (uint32_t i = 0; i < len; ++i) {
+        int32_t returnVal = printResponse(&data[arrayBytes], size - arrayBytes);
+        if (returnVal < 0)
+          return returnVal;
+        arrayBytes += static_cast<size_t>(returnVal);
+      }
+
+      std::cout << "(arr) end\n";
+      return static_cast<int32_t>(arrayBytes);
+    }
+
+  default:
+    msg("bad response");
+    return -1;
+  }
+}
+auto readResult(const int fileDescriptor) -> int32_t {
 
   // 4 bytes header
-  std::vector<uint8_t> rBuffer(4);
-  
+  std::string rBuffer(4 + maxMsg, '\0');
   errno = 0;
-  
-  int32_t err = readFull(fileDescriptor, &rBuffer[0],4);
-  if(err){
-    if(errno == 0) msg("EOF");
-    else msg("read() error");
+
+  int32_t err = readFull(fileDescriptor, rBuffer, 4);
+  if (err) {
+    if (errno == 0)
+      msg("EOF");
+    else
+      msg("read() error");
 
     return err;
   }
 
   uint32_t len{};
-  std::memcpy(&len,rBuffer.data(),4); //assume little endian
-  if(len > maxMsg){
+  std::memcpy(&len, rBuffer.data(), 4); // assume little endian
+  if (len > maxMsg) {
     msg("too long");
     return -1;
   }
 
   // reply body
-  rBuffer.resize(4+len);
-  err = readFull(fileDescriptor, &rBuffer[4], len);
-  if(err){
+  err = readFull(fileDescriptor, rBuffer, len, 4);
+  if (err) {
     msg("read() error");
     return err;
   }
 
-  // do something
-  std::string_view printView{reinterpret_cast<const char *>(&rBuffer[4]),
-                             std::min(len, 100u)};
-  std::cout << "len: " << len << " data: " << printView << '\n';
-  return 0;
-}
+  // print the result
+  int32_t returnVal =
+      printResponse(reinterpret_cast<uint8_t *>(&rBuffer[4]), len);
+  if (returnVal > 0 && static_cast<uint32_t>(returnVal) != len) {
+    msg("bad response");
+    return -1;
+  }
 
-int main() {
+  return returnVal;
+}
+int main(int argc, char **argv) {
 
   int fileDescriptor = socket(AF_INET, SOCK_STREAM, 0);
   if (fileDescriptor < 0)
@@ -124,26 +231,19 @@ int main() {
   if (returnVal)
     die("connect()");
 
-  // multiple pipelined requests
-  std::vector<std::string> queryList =
-      {
-          "hello1", "hello2", "hello3",
-          // a large message requires multiple event loop iterations
-          std::string(maxMsg, 'z'),
-          "hello5",
-      };
-
-  for(const auto& query : queryList){
-    int32_t err = sendRequest(fileDescriptor, reinterpret_cast<const uint8_t *>(query.data()), query.size());
-    if(err) close(fileDescriptor);
+  std::vector<std::string> cmd{};
+  for (auto i = 1; i < argc; ++i) {
+    cmd.push_back(argv[i]);
   }
 
-  for(size_t i = 0; i<queryList.size(); ++i){
-    int32_t err = readResult(fileDescriptor);
-    if(err) close(fileDescriptor);
-  }
+  int32_t err = sendRequest(fileDescriptor, cmd);
+  if (err)
+    close(fileDescriptor);
+
+  err = readResult(fileDescriptor);
+  if (err)
+    close(fileDescriptor);
 
   close(fileDescriptor);
-
   return 0;
 }

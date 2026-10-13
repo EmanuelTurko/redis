@@ -122,6 +122,9 @@ auto mapDelete(HashMap *hashMap, HashNode *key,
   return nullptr;
 }
 auto mapClear(HashMap *hashMap) -> void { *hashMap = HashMap{}; }
+auto mapSize(const HashMap *hashMap) -> size_t {
+  return hashMap->newer.keyCount + hashMap->older.keyCount;
+}
 auto hashForEach(HashTable *hashtable, bool (*f)(HashNode *, void *),
                  void *arg) -> bool {
 

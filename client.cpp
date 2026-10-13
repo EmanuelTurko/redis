@@ -52,23 +52,23 @@ auto sendRequest(const int fileDescriptor,
 
   uint32_t len{4};
   for (const std::string &s : cmd)
-    len += 4 + s.size();
+    len += 4 + static_cast<uint32_t>(s.length());
   if (len > maxMsg)
     return -1;
 
   std::string wBuffer(4 + maxMsg, '\0');
   std::memcpy(&wBuffer[0], &len, 4);
 
-  uint32_t cmdSize = cmd.size();
+  auto cmdSize = static_cast<uint32_t>(cmd.size());
   std::memcpy(&wBuffer[4], &cmdSize, 4);
 
   size_t current{8};
 
   for (const std::string &s : cmd) {
-    uint32_t argLen = static_cast<uint32_t>(s.size());
+    uint32_t argLen = static_cast<uint32_t>(s.length());
     std::memcpy(&wBuffer[current], &argLen, 4);
-    std::memcpy(&wBuffer[current + 4], s.data(), s.size());
-    current += 4 + s.size();
+    std::memcpy(&wBuffer[current + 4], s.data(), s.length());
+    current += 4 + static_cast<uint32_t>(s.length());
   }
 
   return writeAll(fileDescriptor, wBuffer, 4 + len);

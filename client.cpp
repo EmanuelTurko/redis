@@ -11,12 +11,12 @@
 #include <unistd.h>
 #include <vector>
 
-auto readFull(const int fileDescriptor, std::string &buffer, size_t len,
+auto readFull(const int fd, std::string &buffer, size_t len,
               const size_t startingOffset = 0) -> int32_t {
 
   size_t offset{startingOffset};
   while (len > 0) {
-    ssize_t returnVal = read(fileDescriptor, buffer.data() + offset, len);
+    ssize_t returnVal = read(fd, buffer.data() + offset, len);
     if (returnVal <= 0)
       return -1; // error or unexpected EOF
 
@@ -29,11 +29,11 @@ auto readFull(const int fileDescriptor, std::string &buffer, size_t len,
 
   return 0;
 }
-auto writeAll(const int fileDescriptor, std::string_view buffer,
+auto writeAll(const int fd, std::string_view buffer,
               size_t len) -> int32_t {
 
   while (len > 0) {
-    ssize_t returnVal = write(fileDescriptor, buffer.data(), len);
+    ssize_t returnVal = write(fd, buffer.data(), len);
     if (returnVal <= 0)
       return -1; // error or unexpected EOF
 
@@ -47,7 +47,7 @@ auto writeAll(const int fileDescriptor, std::string_view buffer,
   return 0;
 }
 // the `query` function was simply splited into `send_req` and `read_res`.
-auto sendRequest(const int fileDescriptor,
+auto sendRequest(const int fd,
                  const std::vector<std::string> &cmd) -> int32_t {
 
   uint32_t len{4};
@@ -71,12 +71,12 @@ auto sendRequest(const int fileDescriptor,
     current += 4 + static_cast<uint32_t>(s.length());
   }
 
-  return writeAll(fileDescriptor, wBuffer, 4 + len);
+  return writeAll(fd, wBuffer, 4 + len);
 }
 auto printResponse(const uint8_t *data, size_t size) -> int32_t {
 
   if (size < 1) {
-    msg("bad response");
+    msg("bad response1");
     return -1;
   }
 
@@ -86,7 +86,7 @@ auto printResponse(const uint8_t *data, size_t size) -> int32_t {
     return 1;
   case static_cast<int>(Tag::Error):
     if (size < 1 + 8) {
-      msg("bad response");
+      msg("bad response2");
       return -1;
     }
     {
@@ -97,7 +97,7 @@ auto printResponse(const uint8_t *data, size_t size) -> int32_t {
       std::memcpy(&len, &data[1 + 4], 4);
 
       if (size < 1 + 8 + len) {
-        msg("bad response");
+        msg("bad response3");
         return -1;
       }
 
@@ -108,14 +108,14 @@ auto printResponse(const uint8_t *data, size_t size) -> int32_t {
     }
   case static_cast<int>(Tag::String):
     if (size < 1 + 4) {
-      msg("bad response");
+      msg("bad response4");
       return -1;
     }
     {
       uint32_t len{};
       std::memcpy(&len, &data[1], 4);
       if (size < 1 + 4 + len) {
-        msg("bad response");
+        msg("bad response5");
         return -1;
       }
 
@@ -126,7 +126,7 @@ auto printResponse(const uint8_t *data, size_t size) -> int32_t {
     }
   case static_cast<int>(Tag::Int64):
     if (size < 1 + 8) {
-      msg("bad response");
+      msg("bad response6");
       return -1;
     }
     {
@@ -138,7 +138,7 @@ auto printResponse(const uint8_t *data, size_t size) -> int32_t {
     }
   case static_cast<int>(Tag::Double):
     if (size < 1 + 8) {
-      msg("bad response");
+      msg("bad response7");
       return -1;
     }
     {
@@ -149,7 +149,7 @@ auto printResponse(const uint8_t *data, size_t size) -> int32_t {
     }
   case static_cast<int>(Tag::Array):
     if (size < 1 + 4) {
-      msg("bad response");
+      msg("bad response8");
       return -1;
     }
     {
@@ -170,17 +170,17 @@ auto printResponse(const uint8_t *data, size_t size) -> int32_t {
     }
 
   default:
-    msg("bad response");
+    msg("bad response9");
     return -1;
   }
 }
-auto readResult(const int fileDescriptor) -> int32_t {
+auto readResult(const int fd) -> int32_t {
 
   // 4 bytes header
   std::string rBuffer(4 + maxMsg, '\0');
   errno = 0;
 
-  int32_t err = readFull(fileDescriptor, rBuffer, 4);
+  int32_t err = readFull(fd, rBuffer, 4);
   if (err) {
     if (errno == 0)
       msg("EOF");
@@ -198,7 +198,7 @@ auto readResult(const int fileDescriptor) -> int32_t {
   }
 
   // reply body
-  err = readFull(fileDescriptor, rBuffer, len, 4);
+  err = readFull(fd, rBuffer, len, 4);
   if (err) {
     msg("read() error");
     return err;
@@ -208,7 +208,7 @@ auto readResult(const int fileDescriptor) -> int32_t {
   int32_t returnVal =
       printResponse(reinterpret_cast<uint8_t *>(&rBuffer[4]), len);
   if (returnVal > 0 && static_cast<uint32_t>(returnVal) != len) {
-    msg("bad response");
+    msg("bad response10");
     return -1;
   }
 
@@ -216,8 +216,8 @@ auto readResult(const int fileDescriptor) -> int32_t {
 }
 int main(int argc, char **argv) {
 
-  int fileDescriptor = socket(AF_INET, SOCK_STREAM, 0);
-  if (fileDescriptor < 0)
+  Fd fd(socket(AF_INET, SOCK_STREAM, 0));
+  if (fd.get() < 0)
     die("socket()");
 
   sockaddr_in address{};
@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
   address.sin_addr.s_addr = ntohl(INADDR_LOOPBACK); // 127.0.0.1
 
   int returnVal =
-      connect(fileDescriptor, reinterpret_cast<const sockaddr *>(&address),
+      connect(fd.get(), reinterpret_cast<const sockaddr *>(&address),
               sizeof(address));
   if (returnVal)
     die("connect()");
@@ -236,14 +236,11 @@ int main(int argc, char **argv) {
     cmd.push_back(argv[i]);
   }
 
-  int32_t err = sendRequest(fileDescriptor, cmd);
-  if (err)
-    close(fileDescriptor);
+  int32_t err = sendRequest(fd.get(), cmd);
+  if (err) return 1;
 
-  err = readResult(fileDescriptor);
-  if (err)
-    close(fileDescriptor);
+  err = readResult(fd.get());
+  if (err) return 1;
 
-  close(fileDescriptor);
   return 0;
 }

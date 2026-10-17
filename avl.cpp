@@ -2,6 +2,11 @@
 #include <algorithm>
 #include <cassert>
 
+auto AVLTree::init(AVLNode *node) -> void {
+  node->left = node->right = node->parent = nullptr;
+  node->height = 1;
+  node->count = 1;
+}
 auto AVLTree::update(AVLNode *node) -> void {
   node->height = 1 + std::max(getHeight(node->left), getHeight(node->right));
   node->count = 1 + getCount(node->left) + getCount(node->right);
@@ -92,9 +97,9 @@ auto AVLTree::fix(AVLNode *node) -> AVLNode * {
       *from = fixRight(node);
 
     // root node, stop
-    if (!parent){
-        _root = *from;
-        return _root;
+    if (!parent) {
+      _root = *from;
+      return _root;
     }
 
     // continue to the parent node because its height may be changed
@@ -113,7 +118,7 @@ auto AVLTree::removeEasy(AVLNode *node) -> AVLNode * {
     child->parent = parent; // can be nullptr
 
   // attach the child to the grandparent
-  if (!parent){
+  if (!parent) {
     _root = child; // removing the root node
     return _root;
   }
@@ -153,4 +158,62 @@ auto AVLTree::remove(AVLNode *node) -> AVLNode * {
 
   *from = victim;
   return _root;
+}
+auto AVLTree::insert(AVLNode *node, LesserNodeFn isLess) -> void {
+  AVLNode *parent = nullptr;
+  AVLNode **from = &_root;
+  while (*from) {
+    parent = *from;
+    from = isLess(node, parent) ? &parent->left : &parent->right;
+  }
+  *from = node;
+  node->parent = parent;
+
+  fix(node); // assigns _root
+}
+auto AVLTree::dispose(AVLNode *node, DeleteNodeFn del) -> void {
+  if (!node)
+    return;
+
+  dispose(node->left, del);
+  dispose(node->right, del);
+  del(node);
+}
+// offset into the succeeding or preceding node.
+// note: the worst-case is O(log N) regardless of how long the offset is.
+auto AVLTree::offset(AVLNode *node, std::int64_t offset) -> AVLNode * {
+  std::int64_t pos{}; // the rank difference from the starting node
+  while (offset != pos) {
+    if (pos < offset && pos + getCount(node->right) >= offset) {
+      // the target is inside the right subtree
+      node = node->right;
+      pos += getCount(node->left) + 1;
+    } else if (pos > offset && pos - getCount(node->left) <= offset) {
+      // the target is inside the left subtree
+      node = node->left;
+      pos -= getCount(node->right) + 1;
+    } else {
+      // go to the parent
+      auto *parent = node->parent;
+      if (!parent)
+        return nullptr;
+      if (parent->right == node)
+        pos -= getCount(node->left) + 1;
+      else
+        pos += getCount(node->right) + 1;
+
+      node = parent;
+    }
+  }
+  return node;
+}
+auto AVLTree::getCount(AVLNode *node) const -> std::uint32_t {
+  if (node)
+    return node->count;
+  return 0;
+}
+auto AVLTree::getHeight(AVLNode *node) const -> std::uint32_t {
+  if (node)
+    return node->height;
+  return 0;
 }

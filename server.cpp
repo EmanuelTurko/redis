@@ -1,5 +1,7 @@
 #include "hashtable.h"
 #include "protocol.h"
+#include "util.h"
+#include "zset.h"
 #include <cassert>
 #include <cstring>
 #include <fcntl.h>
@@ -10,8 +12,7 @@
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
-#define containerOf(ptr, T, member)                                            \
-  reinterpret_cast<T *>(reinterpret_cast<char *>(ptr) - (offsetof(T, member)))
+static ZSet emptyZSet{};
 using Buffer = std::vector<uint8_t>;
 
 struct Connection {
@@ -33,18 +34,24 @@ enum class ResponseStatus : uint32_t {
   Err = 1,      // error
   NotFound = 2, // key not found
 };
-// +--------+---------+
-// | status | data... |
-// +--------+---------+
-struct Response {
-  ResponseStatus status{ResponseStatus::Ok};
-  std::vector<uint8_t> data{};
-};
 // KV pair for the top-level hashtable
 struct Entry {
+
+  Entry(){};
+  Entry(Types other) {
+    type = other;
+  }
+
+
   struct HashNode node {};
   std::string key{};
-  std::string val{};
+  Types type{};
+  std::string str{};
+  ZSet zSet{};
+};
+struct LookupKey{
+  HashNode node{};
+  std::string key{};
 };
 
 auto setNonBlocking(const int fd) -> void {
@@ -172,58 +179,62 @@ auto serializeArray(Buffer &out, uint32_t arraySize) -> void {
   bufferAppend(out, Tag::Array);
   bufferAppend(out, arraySize);
 }
+auto serializeBeginArray(Buffer &out)-> size_t{
+  bufferAppend(out,Tag::Array);
+  bufferAppend(out, static_cast<uint32_t>(0)); // filled by out_end_arr()
+  return out.size() - 4;                                     // the `ctx` arg
+}
+auto serializeEndArray(Buffer &out, size_t ctx, std::uint32_t n){
+  assert(out[ctx-1] == static_cast<uint8_t>(Tag::Array));
+  std::memcpy(&out[ctx],&n,4);
+}
 // equality comparison for `struct Entry`
 auto eqEntry(HashNode *lhs, HashNode *rhs) -> bool {
   const Entry *leftEntry = containerOf(lhs, Entry, node);
   const Entry *rightEntry = containerOf(rhs, Entry, node);
   return leftEntry->key == rightEntry->key;
 }
-// FNV hash
-auto hashString(const uint8_t *data, size_t len) -> uint64_t {
-  uint32_t hash = 0x811C9DC5;
-  for (size_t i = 0; i < len; ++i) {
-    hash = (hash + data[i]) * 0x01000193;
-  }
-  return hash;
-}
 auto doGet(std::vector<std::string> &cmd, Buffer &out) -> void {
 
   // a dummy `Entry` just for the lookup
   Entry key{};
   key.key.swap(cmd[1]);
-  key.node.hashCode = hashString(
+  key.node.hashCode = stringHash(
       reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
 
   // hashtable lookup
   HashNode *node = gData.lookup(&key.node, &eqEntry);
-  if (!node) {
-    return serializeNil(out);
-  }
+  if(!node) return serializeNil(out);
 
   // copy the value
-  const std::string &val = containerOf(node, Entry, node)->val;
-  return serializeString(out, val);
+  auto entry = containerOf(node, Entry, node);
+  if(entry->type != Types::String){
+    return serializeError(out, TagError::BadType,"not a string value");
+  }
+  return serializeString(out,entry->str);
 }
 auto doSet(std::vector<std::string> &cmd, Buffer &out) -> void {
 
   // a dummy `Entry` just for the lookup
   Entry key{};
   key.key.swap(cmd[1]);
-  key.node.hashCode = hashString(
-      reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
+  key.node.hashCode = stringHash(reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
 
   // hashtable lookup
   HashNode *node = gData.lookup(&key.node, &eqEntry);
   if (node) {
     // found, update the value
-    containerOf(node, Entry, node)->val.swap(cmd[2]);
+    auto entry = containerOf(node, Entry, node);
+    if (entry->type != Types::String) {
+      return serializeError(out, TagError::BadType, "a non-string value exists");
+    }
+    entry->str.swap(cmd[2]);
   } else {
-
     // not found, allocate & insert a new pair
-    Entry *entry = new Entry();
+    auto entry = new Entry(Types::String);
     entry->key.swap(key.key);
     entry->node.hashCode = key.node.hashCode;
-    entry->val.swap(cmd[2]);
+    entry->str.swap(cmd[2]);
     gData.insert(&entry->node);
   }
   return serializeNil(out);
@@ -233,8 +244,7 @@ auto doDel(std::vector<std::string> &cmd, Buffer &out) -> void {
   // a dummy `Entry` just for the lookup
   Entry key{};
   key.key.swap(cmd[1]);
-  key.node.hashCode = hashString(
-      reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
+  key.node.hashCode = stringHash(reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
 
   // hashtable delete
   HashNode *node = gData.remove(&key.node, &eqEntry);
@@ -253,6 +263,103 @@ auto doKeys(std::vector<std::string> &, Buffer &out) -> void {
   serializeArray(out, static_cast<uint32_t>(gData.size()));
   gData.forEach(&keysCallback, static_cast<void *>(&out));
 }
+// zadd zset score name
+auto handleZAdd(std::vector<std::string> &cmd, Buffer &out)->void{
+
+  double score{};
+  if(!stringToDouble(cmd[2],score))
+    return serializeError(out,TagError::BadArg, "expects float");
+
+  // look up or create the zset
+  LookupKey key{};
+  key.key.swap(cmd[1]);
+  key.node.hashCode = stringHash(reinterpret_cast<uint8_t*>(key.key.data()),key.key.length());
+  auto* hashNode = gData.lookup(&key.node, &eqEntry);
+
+  Entry* entry{};
+  if(!hashNode) // insert a new key
+  {
+    entry = new Entry(Types::ZSet);
+    entry->key.swap( key.key);
+    entry->node.hashCode = key.node.hashCode;
+    gData.insert(&entry->node);
+  } else{  // check the existing key
+    entry = containerOf(hashNode,Entry,node);
+    if(entry->type != Types::ZSet)
+      return serializeError(out,TagError::BadType, "expect zset");
+  }
+  // add or update the tuple
+  std::string& name{cmd[3]};
+  bool added = entry->zSet.insert(name,score);
+  return serializeInt(out,added);
+}
+auto lookupZSet(std::string& s)-> ZSet*{
+  LookupKey key{};
+  key.key.swap(s);
+  key.node.hashCode = stringHash(reinterpret_cast<uint8_t*>(key.key.data()),key.key.length());
+  auto* hashNode = gData.lookup(&key.node,eqEntry);
+
+  if (!hashNode) // a non-existent key is treated as an empty zset
+    return &emptyZSet;
+
+  auto* entry = containerOf(hashNode,Entry,node);
+  return entry->type == Types::ZSet? &entry->zSet : nullptr;
+
+}
+// zrem zset name
+auto handleZRem(std::vector<std::string>&cmd,Buffer &out)-> void{
+  auto zSet = lookupZSet(cmd[1]);
+  if(!zSet)
+    return serializeError(out,TagError::BadType,"expect zset");
+
+  std::string &name = cmd[2];
+  auto* zNode = zSet->lookup(name);
+  if(zNode) zSet->remove(zNode);
+
+  return serializeInt(out, zNode? 1 : 0);
+}
+// zscore zset name
+auto handleZScore(std::vector<std::string> &cmd,Buffer &out) -> void{
+  auto zSet = lookupZSet(cmd[1]);
+  if(!zSet) 
+    return serializeError(out,TagError::BadType, "expect zset");
+
+  std::string &name = cmd[2];
+  auto zNode = zSet->lookup(name);
+  return zNode? serializeDouble(out,zNode->score) : serializeNil(out);
+}
+// zquery zset score name offset limit
+auto handleZQuery(std::vector<std::string> &cmd,Buffer &out) -> void{
+  // prase args
+  double score{};
+  if(!stringToDouble(cmd[2],score))
+    return serializeError(out, TagError::BadArg,"expect fp number");
+
+  std::string& name = cmd[3];
+  std::int64_t offset{};
+  std::int64_t limit{};
+  if(!stringToInt(cmd[4],offset) || !stringToInt(cmd[5],limit))
+    return serializeError(out, TagError::BadArg,"expect int");
+
+  // get the zset
+  auto zSet = lookupZSet(cmd[1]);
+  if(!zSet)
+    return serializeError(out,TagError::BadType,"expect zset");
+
+  auto zNode = zSet->seekGreaterOrEqual(name,score);
+  zNode = zSet->offset(zNode,offset);
+
+  // output
+  size_t ctx = serializeBeginArray(out);
+  std::int64_t n{};
+  while(zNode && n < limit){
+    serializeString(out,zNode->name);
+    serializeDouble(out,zNode->score);
+    zNode = zSet->offset(zNode,+1);
+    n+=2;
+  }
+  serializeEndArray(out,ctx,static_cast<std::uint32_t>(n));
+}
 auto doRequest(std::vector<std::string> &cmd, Buffer &out) -> void {
 
   if (cmd.size() == 2 && cmd[0] == "get")
@@ -263,6 +370,14 @@ auto doRequest(std::vector<std::string> &cmd, Buffer &out) -> void {
     return doDel(cmd, out);
   else if (cmd.size() == 1 && cmd[0] == "keys")
     return doKeys(cmd, out);
+  else if (cmd.size() == 4 && cmd[0] == "zadd")
+  return handleZAdd(cmd, out);
+  else if (cmd.size() == 3 && cmd[0] == "zrem")
+  return handleZRem(cmd, out);
+  else if (cmd.size() == 3 && cmd[0] == "zscore")
+  return handleZScore(cmd, out);
+  else if (cmd.size() == 6 && cmd[0] == "zquery")
+  return handleZQuery(cmd, out);
   else
     return serializeError(out, TagError::Unknown, "unknown command");
 }

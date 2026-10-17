@@ -1,10 +1,10 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -Wconversion -O2 -g
+CXXFLAGS = -std=c++17 -Wall -Wextra -Wconversion -O2 -fsanitize=address -g
 
 all: server client
 
-server: server.cpp protocol.h hashtable.h hashtable.cpp avl.h avl.cpp
-	$(CXX) $(CXXFLAGS) server.cpp hashtable.cpp avl.cpp -o server
+server: server.cpp protocol.h hashtable.h hashtable.cpp avl.h avl.cpp zset.h zset.cpp util.h
+	$(CXX) $(CXXFLAGS) server.cpp hashtable.cpp avl.cpp zset.cpp -o server
 
 client: client.cpp protocol.h
 	$(CXX) $(CXXFLAGS) client.cpp -o client

@@ -1,18 +1,22 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 
 struct AVLNode {
   AVLNode *parent{};
   AVLNode *left{};
   AVLNode *right{};
-  std::uint32_t height{}; // subtree height
-  std::uint32_t count{};  // subtree size
+  std::uint32_t height{1}; // subtree height
+  std::uint32_t count{1};  // subtree size
 };
+using LesserNodeFn = bool (*)(AVLNode *, AVLNode *);
+using DeleteNodeFn = void (*)(AVLNode *);
+
 class AVLTree {
 public:
-  AVLTree();
-  AVLTree(AVLNode *node);
+  AVLTree(){};
+  AVLTree(AVLNode *node){ _root = node;}
   ~AVLTree() = default;
 
   AVLTree(AVLTree &) = delete;
@@ -22,11 +26,14 @@ public:
   AVLTree &operator=(AVLTree &&) = default;
 
   auto getRoot() const -> AVLNode * { return _root; }
-  auto getHeight(AVLNode *node) const -> std::uint32_t { return node->height; }
-  auto getCount(AVLNode *node) const -> std::uint32_t { return node->count; }
+  auto getHeight(AVLNode *node) const -> std::uint32_t;
+  auto getCount(AVLNode *node) const -> std::uint32_t;
 
   auto init(AVLNode *node) -> void;
   auto update(AVLNode *node) -> void;
+  auto insert(AVLNode *node, LesserNodeFn isLess) -> void;
+  auto dispose(AVLNode *node, DeleteNodeFn del) -> void;
+  auto offset(AVLNode *node, std::int64_t offset) -> AVLNode *;
 
   auto fix(AVLNode *node) -> AVLNode *;
   auto fixLeft(AVLNode *node) -> AVLNode *;

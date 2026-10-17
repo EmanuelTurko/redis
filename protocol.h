@@ -78,7 +78,15 @@ enum class Tag : uint8_t{
     Array  = 5,    // array
 };
 
-enum class TagError : uint32_t{
+enum class TagError : std::uint32_t{
   Unknown = 1,
   TooBig = 2,
+  BadType = 3,
+  BadArg = 4,
+};
+
+enum class Types : std::uint32_t{
+  Init = 0,
+  String = 1, // string
+  ZSet = 2,   // sorted set
 };

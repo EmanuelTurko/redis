@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <memory>
 #include <netinet/in.h>
@@ -67,6 +68,12 @@ inline void bufferAppendBytes(std::vector<uint8_t> &buffer, const uint8_t *data,
 // remove from the front
 inline void consumeBuffer(std::vector<uint8_t> &buffer, const size_t len) {
   buffer.erase(buffer.begin(), buffer.begin() + len);
+}
+
+inline auto getMonotonicMilliseconds()-> std::uint64_t{
+  timespec time{};
+  clock_gettime(CLOCK_MONOTONIC, &time);
+  return static_cast<uint64_t>(time.tv_sec * 1000 + time.tv_nsec / 1000 / 1000);
 }
 
 enum class Tag : uint8_t{

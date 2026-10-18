@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "util.h"
 #include "zset.h"
+#include "heap.h"
 #include <cassert>
 #include <cstring>
 #include <fcntl.h>
@@ -14,8 +15,12 @@
 #include <unistd.h>
 #include <vector>
 
+
+struct Entry;
+static constexpr size_t NotInHeap = std::numeric_limits<size_t>::max();
 static constexpr std::uint64_t idleTimeoutMilliseconds{5 * 1000};
 static ZSet emptyZSet{};
+static auto setTTL(Entry* entry, std::int64_t TTLmilliseconds) -> void;
 using Buffer = std::vector<uint8_t>;
 
 struct Connection {
@@ -39,6 +44,7 @@ static struct {
   // a map of all client connections, keyed by fd
   std::vector<std::unique_ptr<Connection>> connections;
   DList idleList{};
+  Heap _heap{};
 } gData; // top-level hashtable
 // Response::status
 enum class ResponseStatus : uint32_t {
@@ -51,8 +57,9 @@ struct Entry {
 
   Entry(){};
   Entry(Types other) { type = other; }
-
+  ~Entry() {setTTL(this,-1);}
   struct HashNode node {};
+  size_t heapIdx{NotInHeap};
   std::string key{};
   Types type{};
   std::string str{};
@@ -198,14 +205,14 @@ auto serializeEndArray(Buffer &out, size_t ctx, std::uint32_t n) {
 }
 // equality comparison for `struct Entry`
 auto eqEntry(HashNode *lhs, HashNode *rhs) -> bool {
-  const Entry *leftEntry = containerOf(lhs, Entry, node);
-  const Entry *rightEntry = containerOf(rhs, Entry, node);
-  return leftEntry->key == rightEntry->key;
+  const auto *entry = containerOf(lhs, Entry, node);
+  const auto *lookupKey = containerOf(rhs, LookupKey, node);
+  return entry->key == lookupKey->key;
 }
 auto doGet(std::vector<std::string> &cmd, Buffer &out) -> void {
 
-  // a dummy `Entry` just for the lookup
-  Entry key{};
+  // a dummy `LookupKey` just for the lookup
+  LookupKey key{};
   key.key.swap(cmd[1]);
   key.node.hashCode = stringHash(reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
 
@@ -223,8 +230,8 @@ auto doGet(std::vector<std::string> &cmd, Buffer &out) -> void {
 }
 auto doSet(std::vector<std::string> &cmd, Buffer &out) -> void {
 
-  // a dummy `Entry` just for the lookup
-  Entry key{};
+  // a dummy `LookupKey` just for the lookup
+  LookupKey key{};
   key.key.swap(cmd[1]);
   key.node.hashCode = stringHash(reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
 
@@ -249,8 +256,8 @@ auto doSet(std::vector<std::string> &cmd, Buffer &out) -> void {
 }
 auto doDel(std::vector<std::string> &cmd, Buffer &out) -> void {
 
-  // a dummy `Entry` just for the lookup
-  Entry key{};
+  // a dummy `LookupKey` just for the lookup
+  LookupKey key{};
   key.key.swap(cmd[1]);
   key.node.hashCode = stringHash(reinterpret_cast<const uint8_t *>(key.key.data()), key.key.size());
 
@@ -300,6 +307,58 @@ auto handleZAdd(std::vector<std::string> &cmd, Buffer &out) -> void {
   std::string &name{cmd[3]};
   bool added = entry->zSet.insert(name, score);
   return serializeInt(out, added);
+}
+auto setTTL(Entry *entry, std::int64_t TTLmilliseconds) -> void {
+
+  if (TTLmilliseconds < 0 && entry->heapIdx != NotInHeap) {
+
+    // setting a negative TTL means removing the TTL
+    gData._heap.remove(entry->heapIdx);
+    entry->heapIdx = NotInHeap;
+  } else if (TTLmilliseconds >= 0) {
+    // add or update the heap data structure
+    std::uint64_t expireAt = getMonotonicMilliseconds() + static_cast<uint64_t>(TTLmilliseconds);
+    HeapItem item = {expireAt, &entry->heapIdx};
+    gData._heap.upsert(entry->heapIdx, item);
+  }
+}
+// PEXPIRE key ttl_ms
+auto expire(std::vector<std::string> &cmd, Buffer &out) {
+  std::int64_t TTLmilliseconds{};
+  if (!stringToInt(cmd[2], TTLmilliseconds))
+    return serializeError(out, TagError::BadArg, "expect int64");
+
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hashCode = stringHash(reinterpret_cast<uint8_t *>(key.key.data()), key.key.size());
+
+  auto *node = gData.map.lookup(&key.node, eqEntry);
+  if (node) {
+    auto entry = containerOf(node, Entry, node);
+    setTTL(entry, TTLmilliseconds);
+  }
+
+  return serializeInt(out, node ? 1 : 0);
+}
+// PTTL key
+auto doTTL(std::vector<std::string> &cmd, Buffer &out) -> void {
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hashCode = stringHash(reinterpret_cast<uint8_t *>(key.key.data()), key.key.size());
+
+  auto node = gData.map.lookup(&key.node, eqEntry);
+  if (!node) {
+    return serializeInt(out, -2); // not found
+  }
+
+  auto *entry = containerOf(node, Entry, node);
+  if (entry->heapIdx == NotInHeap) {
+    return serializeInt(out, -1); // no TTL
+  }
+
+  std::uint64_t expireAt = gData._heap[entry->heapIdx].val;
+  std::uint64_t currentMilliseconds = getMonotonicMilliseconds();
+  return serializeInt(out, expireAt > currentMilliseconds ? (expireAt - currentMilliseconds) : 0);
 }
 auto lookupZSet(std::string &s) -> ZSet * {
   LookupKey key{};
@@ -370,12 +429,16 @@ auto handleZQuery(std::vector<std::string> &cmd, Buffer &out) -> void {
 }
 auto doRequest(std::vector<std::string> &cmd, Buffer &out) -> void {
 
-  if (cmd.size() == 2 && cmd[0] == "get")
+  if (cmd.size() == 2 && cmd[0] == "get") 
     return doGet(cmd, out);
   else if (cmd.size() == 3 && cmd[0] == "set")
     return doSet(cmd, out);
   else if (cmd.size() == 2 && cmd[0] == "del")
     return doDel(cmd, out);
+  else if(cmd.size() == 3 && cmd[0] == "pexpire")
+    return expire(cmd,out);
+  else if(cmd.size() == 2 && cmd[0] == "pttl")
+    return doTTL(cmd,out);
   else if (cmd.size() == 1 && cmd[0] == "keys")
     return doKeys(cmd, out);
   else if (cmd.size() == 4 && cmd[0] == "zadd")
@@ -513,18 +576,29 @@ auto handleRead(Connection &connection) -> void {
   } // else: want read
 }
 auto nextTimerMilliseconds() -> std::int32_t {
-  if (gData.idleList.isEmpty())
-    return -1; // no timers, no timeouts
 
-  auto currentMilliseconds = getMonotonicMilliseconds();
-  auto connection = containerOf(gData.idleList.getNext(), Connection, idleNode);
-  std::uint64_t nextMilliseconds = connection->lastActiveMs + idleTimeoutMilliseconds;
+  std::uint64_t currentMilliseconds = getMonotonicMilliseconds();
+  std::uint64_t nextMilliseconds = NotInHeap;
+
+  // idle timers using a linked lis
+  if(!gData.idleList.isEmpty()){
+    auto connection = containerOf(gData.idleList.getNext(), Connection, idleNode);
+    nextMilliseconds = connection->lastActiveMs + idleTimeoutMilliseconds;
+  }
+
+  // TTL timers using a heap
+  if(!gData._heap.empty() && gData._heap[0].val < nextMilliseconds)
+    nextMilliseconds = gData._heap[0].val;
+
+  if(nextMilliseconds == NotInHeap)
+    return -1; // no timers, no timeouts
 
   if (nextMilliseconds <= currentMilliseconds)
     return 0; // missed?
 
   return static_cast<int32_t>(nextMilliseconds - currentMilliseconds);
 }
+auto sameNode(HashNode* node,HashNode* key) -> bool { return node == key;}
 auto processTimers() -> void {
 
   auto currentMilliseconds = getMonotonicMilliseconds();
@@ -536,6 +610,23 @@ auto processTimers() -> void {
 
     std::cerr << "removing idle connection: " << connection->fd.get() << "\n";
     gData.connections[connection->fd.get()] = nullptr;
+  }
+
+  // TTL timers using a heap
+  
+  const size_t maxWorks = 2000;
+  size_t nworks{};
+
+  while(!gData._heap.empty() && gData._heap[0].val < currentMilliseconds){
+    auto entry = containerOf(gData._heap[0].ref,Entry,heapIdx);
+    auto node = gData.map.remove(&entry->node, sameNode);
+    assert(node == &entry->node);
+
+    // fprintf(stderr, "key expired: %s\n", ent->key.c_str());
+    // delete the key
+    delete entry;
+    if (nworks++ >= maxWorks) // don't stall the server if too many keys are expiring at once
+      break;
   }
 }
 /** Server setup
@@ -552,7 +643,6 @@ auto processTimers() -> void {
  *   @param Fd
  */
 int main() {
-
   // AF_INET => IPv4 , AF_INET6 => IPv6
   // SOCK_STREAM => TCP, SOCK_DGRAP => UDP
   Fd fd(socket(AF_INET, SOCK_STREAM, 0));

@@ -42,23 +42,25 @@ auto Heap::down(size_t pos) -> void {
   _heap[pos] = item;
   *_heap[pos].ref = pos;
 }
-auto Heap::upsert(size_t pos,HeapItem item) -> void{
+auto Heap::upsert(size_t pos, HeapItem item) -> void {
 
-    if(pos < _heap.size()) _heap[pos] = item; // update an existing item
-    else{
-        pos = _heap.size();
-        _heap.push_back(item); // or add a new item
-    }
-    update(pos);
+  if (pos < _heap.size())
+    _heap[pos] = item; // update an existing item
+  else {
+    pos = _heap.size();
+    _heap.push_back(item); // or add a new item
+  }
+  update(pos);
 }
-auto Heap::remove(size_t pos) -> void{
+auto Heap::remove(size_t pos) -> void {
 
-    //swap the erased item with the last item
-    _heap[pos] = _heap.back();
-    _heap.pop_back();
+  // swap the erased item with the last item
+  _heap[pos] = _heap.back();
+  _heap.pop_back();
 
-    //update the swapped item
-    if (pos < _heap.size()) update(pos);
+  // update the swapped item
+  if (pos < _heap.size())
+    update(pos);
 }
 
 auto Heap::update(size_t pos) -> void {

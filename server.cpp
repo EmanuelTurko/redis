@@ -1,9 +1,10 @@
 #include "hashtable.h"
+#include "heap.h"
 #include "list.h"
 #include "protocol.h"
+#include "threadpool.h"
 #include "util.h"
 #include "zset.h"
-#include "heap.h"
 #include <cassert>
 #include <cstring>
 #include <fcntl.h>
@@ -15,12 +16,12 @@
 #include <unistd.h>
 #include <vector>
 
-
 struct Entry;
+static constexpr int numThreads = 4;
 static constexpr size_t NotInHeap = std::numeric_limits<size_t>::max();
 static constexpr std::uint64_t idleTimeoutMilliseconds{5 * 1000};
 static ZSet emptyZSet{};
-static auto setTTL(Entry* entry, std::int64_t TTLmilliseconds) -> void;
+static auto setTTL(Entry *entry, std::int64_t TTLmilliseconds) -> void;
 using Buffer = std::vector<uint8_t>;
 
 struct Connection {
@@ -43,8 +44,14 @@ static struct {
   HashMap map{};
   // a map of all client connections, keyed by fd
   std::vector<std::unique_ptr<Connection>> connections;
+
+  // timers for idle connections
   DList idleList{};
+  // timer for TTL
   Heap _heap{};
+  // thread pool
+  ThreadPool threadPool{numThreads};
+
 } gData; // top-level hashtable
 // Response::status
 enum class ResponseStatus : uint32_t {
@@ -57,7 +64,7 @@ struct Entry {
 
   Entry(){};
   Entry(Types other) { type = other; }
-  ~Entry() {setTTL(this,-1);}
+  ~Entry() { setTTL(this, -1); }
   struct HashNode node {};
   size_t heapIdx{NotInHeap};
   std::string key{};
@@ -209,6 +216,20 @@ auto eqEntry(HashNode *lhs, HashNode *rhs) -> bool {
   const auto *lookupKey = containerOf(rhs, LookupKey, node);
   return entry->key == lookupKey->key;
 }
+auto delEntryFn(void *arg) -> void {
+  // std::cerr << "deleting on worker thread " << std::this_thread::get_id() << "\n";
+  delete static_cast<Entry *>(arg);
+}
+auto delEntry(Entry *entry) -> void {
+  setTTL(entry, -1);
+  size_t setSize = (entry->type == Types::ZSet) ? entry->zSet.getMapSize() : 0;
+  const size_t largeContainerSize = 1000;
+  if (setSize > largeContainerSize) {
+    gData.threadPool.queue(delEntryFn, entry);
+  } else {
+    delete entry; // small; avoid context switches
+  }
+}
 auto doGet(std::vector<std::string> &cmd, Buffer &out) -> void {
 
   // a dummy `LookupKey` just for the lookup
@@ -264,7 +285,7 @@ auto doDel(std::vector<std::string> &cmd, Buffer &out) -> void {
   // hashtable delete
   HashNode *node = gData.map.remove(&key.node, &eqEntry);
   if (node) // deallocate the pair
-    delete containerOf(node, Entry, node);
+    delEntry(containerOf(node, Entry, node));
 
   return serializeInt(out, node ? 1 : 0);
 }
@@ -429,16 +450,16 @@ auto handleZQuery(std::vector<std::string> &cmd, Buffer &out) -> void {
 }
 auto doRequest(std::vector<std::string> &cmd, Buffer &out) -> void {
 
-  if (cmd.size() == 2 && cmd[0] == "get") 
+  if (cmd.size() == 2 && cmd[0] == "get")
     return doGet(cmd, out);
   else if (cmd.size() == 3 && cmd[0] == "set")
     return doSet(cmd, out);
   else if (cmd.size() == 2 && cmd[0] == "del")
     return doDel(cmd, out);
-  else if(cmd.size() == 3 && cmd[0] == "pexpire")
-    return expire(cmd,out);
-  else if(cmd.size() == 2 && cmd[0] == "pttl")
-    return doTTL(cmd,out);
+  else if (cmd.size() == 3 && cmd[0] == "pexpire")
+    return expire(cmd, out);
+  else if (cmd.size() == 2 && cmd[0] == "pttl")
+    return doTTL(cmd, out);
   else if (cmd.size() == 1 && cmd[0] == "keys")
     return doKeys(cmd, out);
   else if (cmd.size() == 4 && cmd[0] == "zadd")
@@ -581,16 +602,16 @@ auto nextTimerMilliseconds() -> std::int32_t {
   std::uint64_t nextMilliseconds = NotInHeap;
 
   // idle timers using a linked lis
-  if(!gData.idleList.isEmpty()){
+  if (!gData.idleList.isEmpty()) {
     auto connection = containerOf(gData.idleList.getNext(), Connection, idleNode);
     nextMilliseconds = connection->lastActiveMs + idleTimeoutMilliseconds;
   }
 
   // TTL timers using a heap
-  if(!gData._heap.empty() && gData._heap[0].val < nextMilliseconds)
+  if (!gData._heap.empty() && gData._heap[0].val < nextMilliseconds)
     nextMilliseconds = gData._heap[0].val;
 
-  if(nextMilliseconds == NotInHeap)
+  if (nextMilliseconds == NotInHeap)
     return -1; // no timers, no timeouts
 
   if (nextMilliseconds <= currentMilliseconds)
@@ -598,7 +619,7 @@ auto nextTimerMilliseconds() -> std::int32_t {
 
   return static_cast<int32_t>(nextMilliseconds - currentMilliseconds);
 }
-auto sameNode(HashNode* node,HashNode* key) -> bool { return node == key;}
+auto sameNode(HashNode *node, HashNode *key) -> bool { return node == key; }
 auto processTimers() -> void {
 
   auto currentMilliseconds = getMonotonicMilliseconds();
@@ -613,12 +634,12 @@ auto processTimers() -> void {
   }
 
   // TTL timers using a heap
-  
+
   const size_t maxWorks = 2000;
   size_t nworks{};
 
-  while(!gData._heap.empty() && gData._heap[0].val < currentMilliseconds){
-    auto entry = containerOf(gData._heap[0].ref,Entry,heapIdx);
+  while (!gData._heap.empty() && gData._heap[0].val < currentMilliseconds) {
+    auto entry = containerOf(gData._heap[0].ref, Entry, heapIdx);
     auto node = gData.map.remove(&entry->node, sameNode);
     assert(node == &entry->node);
 
@@ -718,9 +739,9 @@ int main() {
       die("poll");
 
     // handle the listening socket
-    if (pollArgs[0].revents) handleAccept(fd.get());
+    if (pollArgs[0].revents)
+      handleAccept(fd.get());
 
-    
     // handle connection sockets
     for (size_t i = 1; i < pollArgs.size(); ++i) { // skips first pollArgs
       uint32_t ready = pollArgs[i].revents;

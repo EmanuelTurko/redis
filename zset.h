@@ -26,6 +26,8 @@ public:
   auto clear() -> void;
   auto offset(ZNode* node,std::int64_t offset) -> ZNode *;
 
+  auto getMapSize(){return _map.size();}
+  
   static auto disposeNode(AVLNode* node) -> void;
   static auto hashCompare(HashNode *node, HashNode *key) -> bool;
   static auto isLess(AVLNode *left, std::string &name, double score) -> bool;
